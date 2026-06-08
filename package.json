@@ -1,0 +1,29 @@
+{
+  "name": "auto-fix-bug",
+  "version": "1.0.0",
+  "description": "GitHub Issue → Agent 自动修复 → PR → 审核 → 合并 全流程 Web 应用",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [
+    "github",
+    "claude",
+    "agent",
+    "auto-fix"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.0",
+    "@octokit/rest": "^21.0.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
