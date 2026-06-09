@@ -717,25 +717,69 @@ async function gitClone(repoUrl, workDir, defaultBranch, authContext = null) {
   if (defaultBranch === 'main') branchesToTry.push('master');
   else if (defaultBranch === 'master') branchesToTry.push('main');
 
+  // 网络相关错误的 stderr 特征（用于触发重试）
+  const NETWORK_ERR_PATTERNS = [
+    'Connection was reset',
+    'Connection reset',
+    'Connection timed out',
+    'Could not resolve host',
+    'Failed to connect',
+    'empty response',
+    'RPC failed',
+    'The requested URL returned error',
+    'SSL',
+    'schannel',
+    'OpenSSL',
+  ];
+  const isNetworkError = (stderr) =>
+    NETWORK_ERR_PATTERNS.some((p) => stderr.includes(p));
+
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 5000;
+
   let lastErr;
   for (const branch of branchesToTry) {
-    try {
-      execFileSync('git', ['clone', '--depth=1', `--branch=${branch}`, authenticatedUrl, workDir], {
-        stdio: ['inherit', 'pipe', 'pipe'],
-      });
-      return; // 成功
-    } catch (err) {
-      lastErr = err;
-      const stderr = (err.stderr || '').toString().trim();
-      const isBranchErr = stderr.includes('not found') || stderr.includes('not exist') || stderr.includes('does not exist') || stderr.includes('invalid');
-      if (branch !== defaultBranch && !isBranchErr) {
-        // 非分支相关错误，直接抛出
+    let attempts = 0;
+    let success = false;
+    while (attempts < MAX_RETRIES && !success) {
+      try {
+        execFileSync('git', ['clone', '--depth=1', `--branch=${branch}`, authenticatedUrl, workDir], {
+          stdio: ['inherit', 'pipe', 'pipe'],
+        });
+        success = true;
+        return; // 成功
+      } catch (err) {
+        lastErr = err;
+        const stderr = (err.stderr || '').toString().trim();
+        const isBranchErr =
+          stderr.includes('not found') ||
+          stderr.includes('not exist') ||
+          stderr.includes('does not exist') ||
+          stderr.includes('invalid');
+        const isNetErr = isNetworkError(stderr) || isNetworkError(err.message || '');
+
+        if (isBranchErr) {
+          // 分支错误：跳出重试循环，尝试下一个分支
+          break;
+        }
+        if (isNetErr && attempts < MAX_RETRIES - 1) {
+          attempts++;
+          logger.warn(
+            `[Pipeline] git clone 网络错误，第 ${attempts}/${MAX_RETRIES - 1} 次重试 (branch=${branch}): ${stderr || err.message}`
+          );
+          if (fs.existsSync(workDir)) rmDirSafe(workDir);
+          fs.mkdirSync(workDir, { recursive: true });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempts));
+          continue;
+        }
+        // 非网络错误或重试耗尽：抛出
         throw new Error(`git clone 失败 (exit ${err.status}): ${stderr || err.message}`);
       }
-      // 清理失败的目录，准备下一次尝试
-      if (fs.existsSync(workDir)) rmDirSafe(workDir);
-      fs.mkdirSync(workDir, { recursive: true });
     }
+    if (success) return;
+    // 当前分支失败（分支错误导致），清理目录进入下一次循环
+    if (fs.existsSync(workDir)) rmDirSafe(workDir);
+    fs.mkdirSync(workDir, { recursive: true });
   }
   const stderr = (lastErr.stderr || '').toString().trim();
   throw new Error(`git clone 失败 (exit ${lastErr.status}): ${stderr || lastErr.message}`);
