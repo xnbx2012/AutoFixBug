@@ -1,0 +1,5 @@
+# Docker 部署相关
+**/Dockerfile
+**/docker-compose.yml
+**/docker-compose.*.yml
+**/.dockerignore

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Auto-Fix-Bug — GitHub 自动修复平台</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div id="auth-overlay" class="auth-overlay" style="display:none;">
+    <div id="auth-box" class="auth-box"></div>
+  </div>
+
+  <div id="app">
+    <header class="header">
+      <div class="header-left">
+        <h1 class="logo">
+          <span class="logo-mark">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2v20M2 12h20M5.6 5.6l12.8 12.8M18.4 5.6L5.6 18.4" stroke="#141413" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </span>Auto-Fix-Bug
+        </h1>
+        <span class="subtitle">GitHub 自动修复平台</span>
+      </div>
+      <div class="header-right">
+        <div class="status-indicator">
+          <span id="status-indicator" class="status-dot" title="服务运行中"></span>
+          <span>运行中</span>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="config">配置</button>
+      <button class="tab" data-tab="repos">仓库</button>
+      <button class="tab" data-tab="monitors">监控</button>
+      <button class="tab" data-tab="jobs">任务日志</button>
+    </nav>
+
+    <main id="content" class="content">
+      <!-- 动态渲染区域 -->
+    </main>
+
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  auto-fix-bug:
+    build: .
+    container_name: auto-fix-bug
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      # 必填：加密主密钥（64 字符 hex）
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      # 必填：Claude Code API Key
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # 可选：服务配置
+      PORT: ${PORT:-3000}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
+      # 可选：管理员账号
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    env_file:
+      - .env
