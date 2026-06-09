@@ -2,6 +2,52 @@ const { query } = require('@anthropic-ai/claude-code');
 const fs = require('fs');
 const logger = require('../log/logger');
 
+// 网络/API 错误的特征模式（用于触发重试）
+const NETWORK_ERR_PATTERNS = [
+  'Connection was reset',
+  'Connection reset',
+  'Connection timed out',
+  'Connection refused',
+  'Connection closed',
+  'Connection error',
+  'Could not resolve host',
+  'getaddrinfo',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'socket hang up',
+  'fetch failed',
+  'network timeout',
+  'Network request failed',
+  'API_CONNECTION_ERROR',
+  'API_TIMEOUT',
+  'rate_limit',
+  'rate limit',
+  'overloaded',
+  '529',
+  '503',
+  '502',
+  '500',
+  '408',
+  'Request was aborted',
+  'aborted',
+  'TLS',
+  'SSL',
+  'schannel',
+  'OpenSSL',
+];
+
+function isNetworkError(message) {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return NETWORK_ERR_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
+}
+
+const MAX_AGENT_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 5000;
+
 /**
  * 格式化会话记录为可读文本
  * @param {Array} messages SDK 消息数组
@@ -91,103 +137,124 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
   }
   const hasCustomEnv = Object.keys(customEnv).length > 0;
 
-  try {
-    const queryResult = query({
-      prompt: prompt,
-      options: {
-        cwd: cwd,
-        permissionMode: 'bypassPermissions', // 无头模式：自动接受所有工具调用
-        model: agentOpts.model || 'sonnet', // 使用自定义模型或默认 sonnet
-        maxTurns: 50, // 限制最大轮次防止失控
-        ...(hasCustomEnv ? { env: customEnv } : {}),
-        allowedTools: [
-          'Bash',           // 执行命令
-          'Read',           // 读取文件
-          'Write',          // 写入文件
-          'Edit',           // 编辑文件
-          'MultiEdit',      // 批量编辑
-          'Glob',           // 文件搜索
-          'Grep',           // 内容搜索
-          'Agent',          // 子代理
-          'TodoRead',       // 读取 todo
-          'TodoWrite',      // 写入 todo
-          'NotebookEdit',   // Jupyter 编辑
-        ],
-      },
-    });
+  let lastErr = null;
+  for (let attempt = 0; attempt < MAX_AGENT_RETRIES; attempt++) {
+    try {
+      const queryResult = query({
+        prompt: prompt,
+        options: {
+          cwd: cwd,
+          permissionMode: 'bypassPermissions', // 无头模式：自动接受所有工具调用
+          model: agentOpts.model || 'sonnet', // 使用自定义模型或默认 sonnet
+          maxTurns: 50, // 限制最大轮次防止失控
+          ...(hasCustomEnv ? { env: customEnv } : {}),
+          allowedTools: [
+            'Bash',           // 执行命令
+            'Read',           // 读取文件
+            'Write',          // 写入文件
+            'Edit',           // 编辑文件
+            'MultiEdit',      // 批量编辑
+            'Glob',           // 文件搜索
+            'Grep',           // 内容搜索
+            'Agent',          // 子代理
+            'TodoRead',       // 读取 todo
+            'TodoWrite',      // 写入 todo
+            'NotebookEdit',   // Jupyter 编辑
+          ],
+        },
+      });
 
-    // 迭代处理消息流
-    let assistantMsgCount = 0;
-    for await (const message of queryResult) {
-      result.messages.push(message);
+      // 迭代处理消息流
+      let assistantMsgCount = 0;
+      for await (const message of queryResult) {
+        result.messages.push(message);
 
-      // 记录关键消息
-      if (message.type === 'system' && message.subtype === 'init') {
-        result.sessionId = message.session_id;
-        logger.info(`[Agent] Session 初始化: ${message.session_id}, 模型: ${message.model}`);
+        // 记录关键消息
+        if (message.type === 'system' && message.subtype === 'init') {
+          result.sessionId = message.session_id;
+          logger.info(`[Agent] Session 初始化: ${message.session_id}, 模型: ${message.model}`);
+        }
+
+        if (message.type === 'assistant') {
+          // 提取文本内容
+          const textContent = message.message.content
+            .filter(c => c.type === 'text')
+            .map(c => c.text)
+            .join('\n');
+          if (textContent) {
+            logger.info(`[Agent] Assistant: ${textContent.substring(0, 200)}...`);
+          }
+          // 累加 token 使用量
+          const usage = message.message?.usage;
+          if (usage) {
+            result.inputTokens += usage.input_tokens || 0;
+            result.outputTokens += usage.output_tokens || 0;
+            result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
+          }
+          // 调试日志：打印 usage 字段结构（仅前 2 条 assistant 消息）
+          if (assistantMsgCount < 2) {
+            assistantMsgCount++;
+            logger.info(`[Agent] [DEBUG] assistant message keys: ${Object.keys(message.message || {}).join(', ')}`);
+            logger.info(`[Agent] [DEBUG] assistant usage: ${JSON.stringify(usage || 'null')}`);
+            logger.info(`[Agent] [DEBUG] message.usage: ${JSON.stringify(message.usage || 'null')}`);
+          }
+        }
+
+        if (message.type === 'result') {
+          result.result = message.result || '';
+          result.costUSD = message.total_cost_usd || 0;
+          result.numTurns = message.num_turns || 0;
+          result.isError = message.is_error || false;
+          // 兜底：result 消息中也可能携带 usage
+          const usage = message.usage;
+          if (usage) {
+            result.inputTokens += usage.input_tokens || 0;
+            result.outputTokens += usage.output_tokens || 0;
+            result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
+          }
+          // 调试日志：打印 result 消息全部字段
+          logger.info(`[Agent] [DEBUG] result message keys: ${Object.keys(message).join(', ')}`);
+          logger.info(`[Agent] [DEBUG] result.usage: ${JSON.stringify(usage || 'null')}`);
+          if (!usage) {
+            // 尝试其他可能的字段路径
+            const altUsage = message.message?.usage || message.total_usage || message.token_usage || null;
+            logger.info(`[Agent] [DEBUG] result altUsage: ${JSON.stringify(altUsage || 'null')}`);
+          }
+          logger.info(`[Agent] 完成: ${message.num_turns} 轮, $${message.total_cost_usd?.toFixed(4)}`);
+        }
+
+        // 调用外部回调（如果有）
+        if (onMessage) {
+          try {
+            onMessage(message);
+          } catch (err) {
+            logger.warn(`[Agent] onMessage 回调错误: ${err.message}`);
+          }
+        }
       }
 
-      if (message.type === 'assistant') {
-        // 提取文本内容
-        const textContent = message.message.content
-          .filter(c => c.type === 'text')
-          .map(c => c.text)
-          .join('\n');
-        if (textContent) {
-          logger.info(`[Agent] Assistant: ${textContent.substring(0, 200)}...`);
-        }
-        // 累加 token 使用量
-        const usage = message.message?.usage;
-        if (usage) {
-          result.inputTokens += usage.input_tokens || 0;
-          result.outputTokens += usage.output_tokens || 0;
-          result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
-        }
-        // 调试日志：打印 usage 字段结构（仅前 2 条 assistant 消息）
-        if (assistantMsgCount < 2) {
-          assistantMsgCount++;
-          logger.info(`[Agent] [DEBUG] assistant message keys: ${Object.keys(message.message || {}).join(', ')}`);
-          logger.info(`[Agent] [DEBUG] assistant usage: ${JSON.stringify(usage || 'null')}`);
-          logger.info(`[Agent] [DEBUG] message.usage: ${JSON.stringify(message.usage || 'null')}`);
-        }
+      // 成功完成循环，跳出重试
+      break;
+    } catch (err) {
+      lastErr = err;
+      const errMsg = err.message || '';
+      const isNetErr = isNetworkError(errMsg);
+
+      if (isNetErr && attempt < MAX_AGENT_RETRIES - 1) {
+        const delay = RETRY_BASE_DELAY_MS * (attempt + 1);
+        logger.warn(
+          `[Agent] 网络/API 错误，第 ${attempt + 1}/${MAX_AGENT_RETRIES - 1} 次重试，等待 ${delay}ms: ${errMsg}`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
       }
 
-      if (message.type === 'result') {
-        result.result = message.result || '';
-        result.costUSD = message.total_cost_usd || 0;
-        result.numTurns = message.num_turns || 0;
-        result.isError = message.is_error || false;
-        // 兜底：result 消息中也可能携带 usage
-        const usage = message.usage;
-        if (usage) {
-          result.inputTokens += usage.input_tokens || 0;
-          result.outputTokens += usage.output_tokens || 0;
-          result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
-        }
-        // 调试日志：打印 result 消息全部字段
-        logger.info(`[Agent] [DEBUG] result message keys: ${Object.keys(message).join(', ')}`);
-        logger.info(`[Agent] [DEBUG] result.usage: ${JSON.stringify(usage || 'null')}`);
-        if (!usage) {
-          // 尝试其他可能的字段路径
-          const altUsage = message.message?.usage || message.total_usage || message.token_usage || null;
-          logger.info(`[Agent] [DEBUG] result altUsage: ${JSON.stringify(altUsage || 'null')}`);
-        }
-        logger.info(`[Agent] 完成: ${message.num_turns} 轮, $${message.total_cost_usd?.toFixed(4)}`);
-      }
-
-      // 调用外部回调（如果有）
-      if (onMessage) {
-        try {
-          onMessage(message);
-        } catch (err) {
-          logger.warn(`[Agent] onMessage 回调错误: ${err.message}`);
-        }
-      }
+      // 非网络错误或重试耗尽
+      logger.error(`[Agent] SDK 调用失败: ${errMsg}`);
+      result.isError = true;
+      result.result = `Error: ${errMsg}`;
+      break;
     }
-  } catch (err) {
-    logger.error(`[Agent] SDK 调用失败: ${err.message}`);
-    result.isError = true;
-    result.result = `Error: ${err.message}`;
   }
 
   // 持久化会话记录
