@@ -44,7 +44,10 @@ router.post('/', (req, res) => {
       return res.status(400).json({ error: `仓库 ${owner}/${name} 已存在` });
     }
 
-    const repo = queries.addRepo({ url, owner, name, default_branch: defaultBranch });
+    // 规范化 URL：无论用户输入的是仓库根 URL、Issue URL 还是任意子路径，
+    // 一律存储为 https://github.com/{owner}/{name}，防止 Issue URL 被传入 git clone
+    const normalizedUrl = `https://github.com/${owner}/${name}`;
+    const repo = queries.addRepo({ url: normalizedUrl, owner, name, default_branch: defaultBranch });
     res.json({ success: true, repo });
   } catch (err) {
     res.status(500).json({ error: err.message });

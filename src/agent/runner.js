@@ -1,8 +1,8 @@
-const { query } = require('@anthropic-ai/claude-code');
+const { query } = require('@anthropic-ai/claude-agent-sdk');
 const fs = require('fs');
 const logger = require('../log/logger');
 
-// 网络/API 错误的特征模式（用于触发重试）
+// 网络/API 错误（连接/超时/HTTP 5xx）—— 触发外层 query() 重试
 const NETWORK_ERR_PATTERNS = [
   'Connection was reset',
   'Connection reset',
@@ -47,6 +47,10 @@ function isNetworkError(message) {
 
 const MAX_AGENT_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 5000;
+
+// Agent 异常退出（is_error=true）后，自动发送"继续"重试
+const MAX_CONTINUE_RETRIES = 10;
+const CONTINUE_RETRY_DELAY_MS = 1000;
 
 /**
  * 格式化会话记录为可读文本
@@ -108,10 +112,13 @@ function formatSessionTranscript(messages) {
  *   - model {string} 自定义模型名（如 'opus', 'sonnet', 'haiku'）
  *   - apiKey {string} 自定义 API Key（将作为 ANTHROPIC_API_KEY 注入）
  *   - apiBaseUrl {string} 自定义 API Base URL（将作为 ANTHROPIC_BASE_URL 注入）
+ *   - _resumeSessionId {string} 内部：用于在同一会话中发送"继续"消息
  * @param {string} sessionPath 会话记录保存路径（可选）
- * @returns {Promise<{result: string, sessionId: string, costUSD: number, numTurns: number, isError: boolean}>}
+ * @param {object|null} outputFormat 结构化输出配置（可选）
+ *   - { type: 'json_schema', schema: {...} }
+ * @returns {Promise<{result: string, sessionId: string, costUSD: number, numTurns: number, isError: boolean, structuredOutput: object|null, structuredOutputError: string|null}>}
  */
-async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPath = null) {
+async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPath = null, outputFormat = null) {
   logger.info(`[Agent] 启动 Claude Code Agent, cwd: ${cwd}`);
   logger.debug(`[Agent] Prompt 长度: ${prompt.length} 字符`);
 
@@ -125,7 +132,19 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
     inputTokens: 0,
     outputTokens: 0,
     cacheReadInputTokens: 0,
+    toolUseCount: 0,
+    structuredOutput: null,
+    structuredOutputError: null,
   };
+
+  // 是否为 resume 模式（同会话"继续"），跳过内部自动 continue 重试
+  const resumeSessionId = agentOpts._resumeSessionId || null;
+  const isResume = !!resumeSessionId;
+  // resume 模式不继承 _resumeSessionId 字段（避免污染 query options）
+  if (isResume) {
+    agentOpts = { ...agentOpts };
+    delete agentOpts._resumeSessionId;
+  }
 
   // 构建自定义 env：仅在提供了 apiKey / apiBaseUrl 时才注入
   const customEnv = {};
@@ -148,6 +167,8 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
           model: agentOpts.model || 'sonnet', // 使用自定义模型或默认 sonnet
           maxTurns: 50, // 限制最大轮次防止失控
           ...(hasCustomEnv ? { env: customEnv } : {}),
+          ...(outputFormat ? { outputFormat } : {}),
+          ...(isResume && resumeSessionId ? { resume: resumeSessionId } : {}),
           allowedTools: [
             'Bash',           // 执行命令
             'Read',           // 读取文件
@@ -191,6 +212,10 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
             result.outputTokens += usage.output_tokens || 0;
             result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
           }
+          // 累加工具调用次数（诊断用：判断 Agent 到底干活没有）
+          for (const block of message.message?.content || []) {
+            if (block.type === 'tool_use') result.toolUseCount++;
+          }
           // 调试日志：打印 usage 字段结构（仅前 2 条 assistant 消息）
           if (assistantMsgCount < 2) {
             assistantMsgCount++;
@@ -205,6 +230,15 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
           result.costUSD = message.total_cost_usd || 0;
           result.numTurns = message.num_turns || 0;
           result.isError = message.is_error || false;
+          // 提取结构化输出（SDK 2.x 特性）
+          if (message.structured_output !== undefined && message.structured_output !== null) {
+            result.structuredOutput = message.structured_output;
+            logger.info(`[Agent] 结构化输出: ${JSON.stringify(message.structured_output).substring(0, 500)}`);
+          }
+          if (message.subtype === 'error_max_structured_output_retries') {
+            result.structuredOutputError = 'error_max_structured_output_retries';
+            logger.warn('[Agent] 结构化输出验证失败（达到最大重试次数），将回退到文本解析');
+          }
           // 兜底：result 消息中也可能携带 usage
           const usage = message.usage;
           if (usage) {
@@ -220,7 +254,7 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
             const altUsage = message.message?.usage || message.total_usage || message.token_usage || null;
             logger.info(`[Agent] [DEBUG] result altUsage: ${JSON.stringify(altUsage || 'null')}`);
           }
-          logger.info(`[Agent] 完成: ${message.num_turns} 轮, $${message.total_cost_usd?.toFixed(4)}`);
+          logger.info(`[Agent] 完成: ${message.num_turns} 轮, $${message.total_cost_usd?.toFixed(4)}, is_error=${result.isError}, has_structured_output=${!!result.structuredOutput}`);
         }
 
         // 调用外部回调（如果有）
@@ -233,7 +267,7 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
         }
       }
 
-      // 成功完成循环，跳出重试
+      // 成功完成循环（不含异常退出重试）—— 如果 is_error=true 触发 continue 重试
       break;
     } catch (err) {
       lastErr = err;
@@ -254,6 +288,115 @@ async function runAgent(prompt, cwd, onMessage = null, agentOpts = {}, sessionPa
       result.isError = true;
       result.result = `Error: ${errMsg}`;
       break;
+    }
+  }
+
+  // ——— 异常退出自动"继续"重试（Agent 以 is_error=true 完成，会话本身有效）———
+  // 注意：resume 模式（同一会话"继续"）不进入此分支，由外部 pipeline 决定是否继续
+  if (result.isError && result.sessionId && !isResume) {
+    logger.info(
+      `[Agent] 检测到异常退出 (is_error=true, turns=${result.numTurns})，` +
+      `启动"继续"重试，最多 ${MAX_CONTINUE_RETRIES} 次，间隔 ${CONTINUE_RETRY_DELAY_MS}ms`
+    );
+
+    for (let c = 0; c < MAX_CONTINUE_RETRIES; c++) {
+      // 等待间隔（先等待再重试，给 API 恢复时间）
+      await new Promise((r) => setTimeout(r, CONTINUE_RETRY_DELAY_MS));
+
+      logger.info(`[Agent] "继续"重试 ${c + 1}/${MAX_CONTINUE_RETRIES}，sessionId=${result.sessionId}`);
+
+      try {
+        const continueResult = query({
+          prompt: '继续',
+          options: {
+            cwd: cwd,
+            resume: result.sessionId,
+            permissionMode: 'bypassPermissions',
+            model: agentOpts.model || 'sonnet',
+            maxTurns: 30,
+            ...(hasCustomEnv ? { env: customEnv } : {}),
+            ...(outputFormat ? { outputFormat } : {}),
+          },
+        });
+
+        let continueIsError = false;
+        for await (const message of continueResult) {
+          result.messages.push(message);
+
+          if (message.type === 'assistant') {
+            const textContent = message.message.content
+              .filter((bc) => bc.type === 'text')
+              .map((bc) => bc.text)
+              .join('\n');
+            if (textContent) {
+              logger.info(`[Agent] [继续 ${c + 1}] Assistant: ${textContent.substring(0, 200)}...`);
+            }
+            const usage = message.message?.usage;
+            if (usage) {
+              result.inputTokens += usage.input_tokens || 0;
+              result.outputTokens += usage.output_tokens || 0;
+              result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
+            }
+            for (const block of message.message?.content || []) {
+              if (block.type === 'tool_use') result.toolUseCount++;
+            }
+          }
+
+          if (message.type === 'result') {
+            const usage = message.usage;
+            if (usage) {
+              result.inputTokens += usage.input_tokens || 0;
+              result.outputTokens += usage.output_tokens || 0;
+              result.cacheReadInputTokens += usage.cache_read_input_tokens || 0;
+            }
+            // 覆盖主结果
+            result.result = message.result || result.result;
+            result.costUSD = (result.costUSD || 0) + (message.total_cost_usd || 0);
+            result.numTurns = (result.numTurns || 0) + (message.num_turns || 0);
+            continueIsError = message.is_error || false;
+            // 提取结构化输出（继续重试也可能是结构化的）
+            if (message.structured_output !== undefined && message.structured_output !== null) {
+              result.structuredOutput = message.structured_output;
+              logger.info(`[Agent] [继续 ${c + 1}] 结构化输出: ${JSON.stringify(message.structured_output).substring(0, 500)}`);
+            }
+            if (message.subtype === 'error_max_structured_output_retries') {
+              result.structuredOutputError = 'error_max_structured_output_retries';
+              logger.warn(`[Agent] [继续 ${c + 1}] 结构化输出验证失败`);
+            }
+            logger.info(
+              `[Agent] [继续 ${c + 1}] 完成: turns=${message.num_turns}, ` +
+              `cost=$${message.total_cost_usd?.toFixed(4)}, is_error=${continueIsError}`
+            );
+          }
+
+          if (onMessage) {
+            try { onMessage(message); } catch (_) { /* 忽略 */ }
+          }
+        }
+
+        if (!continueIsError) {
+          // 恢复成功：重置 isError，后续走正常流程
+          result.isError = false;
+          logger.info(`[Agent] "继续"重试第 ${c + 1} 次成功，Agent 已恢复`);
+          break;
+        }
+
+        // 仍是 is_error=true，继续下一轮
+        logger.warn(`[Agent] "继续"重试第 ${c + 1} 次仍失败 (is_error=true)，${c < MAX_CONTINUE_RETRIES - 1 ? '将再次重试' : '已达重试上限'}`);
+      } catch (continueErr) {
+        // "继续"调用本身抛异常（网络错误等）—— 不对外层做特殊处理，继续下一轮
+        logger.warn(
+          `[Agent] "继续"重试第 ${c + 1} 次调用异常: ${continueErr.message}，` +
+          `${c < MAX_CONTINUE_RETRIES - 1 ? '将再次重试' : '已达重试上限'}`
+        );
+      }
+    }
+
+    if (result.isError) {
+      logger.error(
+        `[Agent] "继续"重试 ${MAX_CONTINUE_RETRIES} 次后仍为 is_error=true，最终放弃。` +
+        `最终输出 (前 500 字符): ${(result.result || '').substring(0, 500)}`
+      );
     }
   }
 

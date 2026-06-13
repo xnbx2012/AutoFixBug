@@ -17,7 +17,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/claude-code": "^1.0.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.177",
     "@octokit/rest": "^21.0.0",
     "better-sqlite3": "^11.0.0",
     "dotenv": "^16.4.0",
