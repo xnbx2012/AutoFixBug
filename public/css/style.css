@@ -865,18 +865,14 @@ a.link:hover {
   grid-column: 1 / -1;
 }
 
-/* Heatmap canvas */
-#dash-heatmap {
-  display: block;
-  max-width: 100%;
+/* ECharts 图表容器 */
+.echarts-chart {
+  width: 100%;
+  height: 300px;
 }
 
-/* Chart.js canvas 高度 */
-#dash-token-trend,
-#dash-pr-status,
-#dash-repo-issues,
-#dash-duration {
-  max-height: 300px;
+.echarts-chart.echarts-heatmap {
+  height: 160px;
 }
 
 @media (max-width: 768px) {

@@ -966,7 +966,40 @@
   // 热力图色阶
   const HEATMAP_COLORS = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39'];
 
+  // ============ ECharts 实例管理 ============
+  // 维护当前页面上的 echarts 实例，用于：重渲染前销毁旧实例、窗口尺寸变化时自适应
+  const echartsInstances = {};
+
+  // 获取或创建指定容器上的 echarts 实例（先销毁旧实例，避免重复绑定）
+  function getChart(domId) {
+    const dom = document.getElementById(domId);
+    if (!dom || !window.echarts) return null;
+    if (echartsInstances[domId]) {
+      echartsInstances[domId].dispose();
+    }
+    const inst = echarts.init(dom);
+    echartsInstances[domId] = inst;
+    return inst;
+  }
+
+  // 销毁所有现存 echarts 实例（Dashboard 重渲染前调用）
+  function disposeAllCharts() {
+    for (const id of Object.keys(echartsInstances)) {
+      try { echartsInstances[id].dispose(); } catch (_) {}
+      delete echartsInstances[id];
+    }
+  }
+
+  // 窗口尺寸变化时让所有图表自适应容器宽度
+  window.addEventListener('resize', () => {
+    for (const id of Object.keys(echartsInstances)) {
+      try { echartsInstances[id].resize(); } catch (_) {}
+    }
+  });
+
   async function renderDashboard(container) {
+    // 销毁上一轮的 echarts 实例，防止内存泄漏与重复绑定
+    disposeAllCharts();
     container.appendChild(el('h1', { className: 'section-title' }, ['Dashboard']));
     container.appendChild(el('p', { className: 'section-subtitle' }, ['Issue 修复全局概览与数据洞察']));
 
@@ -987,36 +1020,36 @@
     // 1. 热力图（占满一行）
     const heatCard = el('div', { className: 'card dash-card-wide' });
     heatCard.appendChild(el('h2', {}, ['修复热力图（近 6 个月）']));
-    const heatCanvas = el('canvas', { id: 'dash-heatmap', width: '720', height: '120', style: 'width:100%;height:auto;' });
-    heatCard.appendChild(heatCanvas);
+    const heatBox = el('div', { id: 'dash-heatmap', className: 'echarts-chart echarts-heatmap' });
+    heatCard.appendChild(heatBox);
     grid.appendChild(heatCard);
 
     // 2. Token 趋势
     const tokenCard = el('div', { className: 'card' });
     tokenCard.appendChild(el('h2', {}, ['Token 消耗趋势']));
-    const tokenCanvas = el('canvas', { id: 'dash-token-trend' });
-    tokenCard.appendChild(tokenCanvas);
+    const tokenBox = el('div', { id: 'dash-token-trend', className: 'echarts-chart' });
+    tokenCard.appendChild(tokenBox);
     grid.appendChild(tokenCard);
 
     // 3. PR 状态分布
     const prCard = el('div', { className: 'card' });
     prCard.appendChild(el('h2', {}, ['任务状态分布']));
-    const prCanvas = el('canvas', { id: 'dash-pr-status' });
-    prCard.appendChild(prCanvas);
+    const prBox = el('div', { id: 'dash-pr-status', className: 'echarts-chart' });
+    prCard.appendChild(prBox);
     grid.appendChild(prCard);
 
     // 4. 各仓库 Issue 数量
     const repoCard = el('div', { className: 'card' });
     repoCard.appendChild(el('h2', {}, ['各仓库 Issue 数量']));
-    const repoCanvas = el('canvas', { id: 'dash-repo-issues' });
-    repoCard.appendChild(repoCanvas);
+    const repoBox = el('div', { id: 'dash-repo-issues', className: 'echarts-chart' });
+    repoCard.appendChild(repoBox);
     grid.appendChild(repoCard);
 
     // 5. 平均修复时长
     const durCard = el('div', { className: 'card' });
     durCard.appendChild(el('h2', {}, ['平均修复时长（近 7 天）']));
-    const durCanvas = el('canvas', { id: 'dash-duration' });
-    durCard.appendChild(durCanvas);
+    const durBox = el('div', { id: 'dash-duration', className: 'echarts-chart' });
+    durCard.appendChild(durBox);
     grid.appendChild(durCard);
 
     container.appendChild(grid);
@@ -1067,204 +1100,158 @@
     return c;
   }
 
-  // ---- 热力图（Canvas 手绘 GitHub 贡献图风格） ----
+  // ---- 热力图（ECharts Calendar Heatmap — GitHub 贡献图风格） ----
   function renderHeatmap(data) {
-    const canvas = document.getElementById('dash-heatmap');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const weeks = 27; // ~6 个月
-    const dpr = window.devicePixelRatio || 1;
-    const labelOffsetX = 28; // 星期标签区宽度
-    const labelOffsetY = 14; // 月份标签区高度
+    const chart = getChart('dash-heatmap');
+    if (!chart) return;
+    if (!data.length) { chart.clear(); return; }
 
-    // 自适应容器宽度：cellSize 由卡片宽度反推
-    const containerWidth = canvas.parentElement.clientWidth - 48; // 减去卡片内边距
-    const gap = 2;
-    const cellSize = Math.max(4, Math.floor((containerWidth - labelOffsetX - gap * weeks) / weeks) - gap);
-    const cellStep = cellSize + gap;
-
-    canvas.width = (labelOffsetX + weeks * cellStep + 4) * dpr;
-    canvas.height = (labelOffsetY + 7 * cellStep + 4) * dpr;
-    canvas.style.width = (labelOffsetX + weeks * cellStep + 4) + 'px';
-    canvas.style.height = (labelOffsetY + 7 * cellStep + 4) + 'px';
-    ctx.scale(dpr, dpr);
-
-    // 建立 date -> count 映射
-    const countMap = {};
-    for (const row of data) { countMap[row.date] = row.count; }
-
-    // 找到 6 个月前的周一（统一按 Asia/Shanghai 计算）
-    const nowMs = Date.now();
+    // 计算最近 6 个月的起止日期（按 Asia/Shanghai）
     const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
-    const today = new Date(nowMs + SHANGHAI_OFFSET_MS);
-    const startDate = new Date(today);
-    startDate.setDate(startDate.getDate() - weeks * 7 - startDate.getDay());
+    const today = new Date(Date.now() + SHANGHAI_OFFSET_MS);
+    const start = new Date(today);
+    start.setMonth(start.getMonth() - 6);
+    const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
-    const months = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
-    const dayLabels = ['日','一','二','三','四','五','六'];
+    const points = data.map(d => [d.date, d.count || 0]);
+    const maxCount = Math.max(1, ...data.map(d => d.count || 0));
 
-    const maxCount = Math.max(1, ...data.map(d => d.count));
-
-    for (let w = 0; w < weeks; w++) {
-      for (let d = 0; d < 7; d++) {
-        const date = new Date(startDate);
-        date.setDate(date.getDate() + w * 7 + d);
-        if (date > today) continue;
-
-        const yyyy = date.getFullYear();
-        const mm = String(date.getMonth() + 1).padStart(2, '0');
-        const dd = String(date.getDate()).padStart(2, '0');
-        const key = `${yyyy}-${mm}-${dd}`;
-        const count = countMap[key] || 0;
-
-        let level = 0;
-        if (count > 0) {
-          const ratio = count / maxCount;
-          if (ratio <= 0.25) level = 1;
-          else if (ratio <= 0.5) level = 2;
-          else if (ratio <= 0.75) level = 3;
-          else level = 4;
-        }
-
-        const x = w * cellStep + labelOffsetX;
-        const y = d * cellStep + labelOffsetY;
-        ctx.fillStyle = HEATMAP_COLORS[level];
-        ctx.beginPath();
-        ctx.roundRect(x, y, cellSize, cellSize, 2);
-        ctx.fill();
-      }
-      // 月份标签（每月第一周显示）
-      const firstDay = new Date(startDate);
-      firstDay.setDate(firstDay.getDate() + w * 7);
-      if (firstDay.getDate() <= 7 && firstDay <= today) {
-        ctx.fillStyle = '#6c6a64';
-        ctx.font = '10px sans-serif';
-        ctx.fillText(months[firstDay.getMonth()], w * cellStep + labelOffsetX, 10);
-      }
-    }
-
-    // 星期标签
-    ctx.fillStyle = '#6c6a64';
-    ctx.font = '10px sans-serif';
-    for (let d = 0; d < 7; d += 2) {
-      ctx.fillText(dayLabels[d], 0, d * cellStep + labelOffsetY + cellSize * 0.75);
-    }
+    chart.setOption({
+      tooltip: { formatter: (p) => `${p.value[0]}<br/>修复 ${p.value[1]} 次` },
+      visualMap: {
+        min: 0,
+        max: maxCount,
+        show: false,
+        inRange: { color: HEATMAP_COLORS },
+      },
+      calendar: {
+        top: 20,
+        left: 40,
+        right: 20,
+        bottom: 10,
+        range: [fmt(start), fmt(today)],
+        cellSize: ['auto', 13],
+        orient: 'horizontal',
+        splitLine: { show: false },
+        yearLabel: { show: false },
+        monthLabel: { nameMap: 'cn', color: '#6c6a64', fontSize: 11, margin: 8 },
+        dayLabel: { firstDay: 1, nameMap: ['日','一','二','三','四','五','六'], color: '#6c6a64', fontSize: 11 },
+        itemStyle: { borderWidth: 2, borderColor: '#ffffff', color: '#ebedf0' },
+      },
+      series: [{ type: 'heatmap', coordinateSystem: 'calendar', data: points }],
+    });
   }
 
   // ---- 折线图：Token 趋势（按天） ----
   function renderTokenTrend(data) {
-    if (!data.length) return;
-    const canvas = document.getElementById('dash-token-trend');
-    if (!canvas || !window.Chart) return;
-    new Chart(canvas, {
-      type: 'line',
-      data: {
-        labels: data.map(d => d.day),
-        datasets: [
-          { label: '输入 Token', data: data.map(d => d.input), borderColor: '#cc785c', backgroundColor: 'rgba(204,120,92,0.08)', tension: 0.3, fill: true, pointRadius: 4, pointBackgroundColor: '#cc785c' },
-          { label: '输出 Token', data: data.map(d => d.output), borderColor: '#5db8a6', backgroundColor: 'rgba(93,184,166,0.08)', tension: 0.3, fill: true, pointRadius: 4, pointBackgroundColor: '#5db8a6' },
-          { label: '缓存创建', data: data.map(d => d.cache), borderColor: '#e8a55a', backgroundColor: 'rgba(232,165,90,0.08)', tension: 0.3, fill: true, pointRadius: 4, pointBackgroundColor: '#e8a55a' },
-        ]
+    const chart = getChart('dash-token-trend');
+    if (!chart) return;
+    if (!data.length) { chart.clear(); return; }
+    chart.setOption({
+      tooltip: { trigger: 'axis' },
+      legend: { bottom: 0, icon: 'circle', itemWidth: 8, itemHeight: 8, textStyle: { color: '#6c6a64' } },
+      grid: { left: 50, right: 16, top: 16, bottom: 40 },
+      xAxis: {
+        type: 'category',
+        data: data.map(d => d.day),
+        axisLabel: { color: '#6c6a64', fontSize: 11, formatter: v => v.slice(5) },
+        axisLine: { lineStyle: { color: '#e6dfd8' } },
+        axisTick: { lineStyle: { color: '#e6dfd8' } },
       },
-      options: {
-        responsive: true,
-        plugins: { legend: { position: 'bottom', labels: { padding: 16, usePointStyle: true, pointStyle: 'circle' } } },
-        scales: {
-          x: { ticks: { maxRotation: 45, callback: v => v.slice(5) } }, // 去掉年份，只显示 MM-DD
-          y: { beginAtZero: true, ticks: { callback: v => formatTokenCount(v) } },
-        },
-      }
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#6c6a64', fontSize: 11, formatter: v => formatTokenCount(v) },
+        splitLine: { lineStyle: { color: '#ebe6df' } },
+      },
+      series: [
+        { name: '输入 Token', type: 'line', smooth: true, showSymbol: true, symbolSize: 6, data: data.map(d => d.input), itemStyle: { color: '#cc785c' }, areaStyle: { color: 'rgba(204,120,92,0.08)' } },
+        { name: '输出 Token', type: 'line', smooth: true, showSymbol: true, symbolSize: 6, data: data.map(d => d.output), itemStyle: { color: '#5db8a6' }, areaStyle: { color: 'rgba(93,184,166,0.08)' } },
+        { name: '缓存创建', type: 'line', smooth: true, showSymbol: true, symbolSize: 6, data: data.map(d => d.cache), itemStyle: { color: '#e8a55a' }, areaStyle: { color: 'rgba(232,165,90,0.08)' } },
+      ],
     });
   }
 
-  // ---- 环形图：PR 状态分布 ----
+  // ---- 环形图：任务状态分布 ----
   function renderPrStatus(prStatus) {
+    const chart = getChart('dash-pr-status');
+    if (!chart) return;
     const labels = Object.keys(prStatus);
-    if (!labels.length) return;
-    const canvas = document.getElementById('dash-pr-status');
-    if (!canvas || !window.Chart) return;
-    new Chart(canvas, {
-      type: 'doughnut',
-      data: {
-        labels: labels.map(l => STATUS_LABELS[l] || l),
-        datasets: [{
-          data: labels.map(l => prStatus[l]),
-          backgroundColor: labels.map(l => STATUS_COLORS[l] || '#8e8b82'),
-          borderWidth: 0,
-          hoverOffset: 6,
-        }]
-      },
-      options: {
-        responsive: true,
-        cutout: '55%',
-        plugins: { legend: { position: 'bottom', labels: { padding: 14, usePointStyle: true, pointStyle: 'circle' } } },
-      }
+    if (!labels.length) { chart.clear(); return; }
+    chart.setOption({
+      tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+      legend: { bottom: 0, icon: 'circle', itemWidth: 8, itemHeight: 8, textStyle: { color: '#6c6a64' } },
+      series: [{
+        type: 'pie',
+        radius: ['40%', '65%'],
+        center: ['50%', '45%'],
+        avoidLabelOverlap: true,
+        label: { show: false },
+        labelLine: { show: false },
+        data: labels.map(l => ({
+          value: prStatus[l],
+          name: STATUS_LABELS[l] || l,
+          itemStyle: { color: STATUS_COLORS[l] || '#8e8b82' },
+        })),
+        emphasis: { itemStyle: { shadowBlur: 10, shadowOffsetX: 0, shadowColor: 'rgba(0,0,0,0.15)' } },
+      }],
     });
   }
 
   // ---- 堆叠柱状图：各仓库 Issue 数量（按状态拆分） ----
   function renderRepoIssues(data) {
-    if (!data.length) return;
-    const canvas = document.getElementById('dash-repo-issues');
-    if (!canvas || !window.Chart) return;
-    new Chart(canvas, {
-      type: 'bar',
-      data: {
-        labels: data.map(d => d.repo),
-        datasets: [
-          {
-            label: '已关闭（merged/failed）',
-            data: data.map(d => d.closed),
-            backgroundColor: '#5db872',
-            borderRadius: { topLeft: 4, topRight: 4 },
-            maxBarThickness: 48,
-          },
-          {
-            label: '进行中',
-            data: data.map(d => d.open),
-            backgroundColor: '#e8a55a',
-            borderRadius: { bottomLeft: 4, bottomRight: 4 },
-            maxBarThickness: 48,
-          },
-        ]
+    const chart = getChart('dash-repo-issues');
+    if (!chart) return;
+    if (!data.length) { chart.clear(); return; }
+    chart.setOption({
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: { bottom: 0, icon: 'rect', itemWidth: 10, itemHeight: 10, textStyle: { color: '#6c6a64' } },
+      grid: { left: 60, right: 16, top: 16, bottom: 40 },
+      xAxis: {
+        type: 'value',
+        axisLabel: { color: '#6c6a64', fontSize: 11 },
+        splitLine: { lineStyle: { color: '#ebe6df' } },
       },
-      options: {
-        responsive: true,
-        indexAxis: 'y',
-        plugins: { legend: { position: 'bottom', labels: { padding: 14, usePointStyle: true, pointStyle: 'rect' } } },
-        scales: {
-          x: { stacked: true, beginAtZero: true, ticks: { stepSize: 1 } },
-          y: { stacked: true },
-        },
-      }
+      yAxis: {
+        type: 'category',
+        data: data.map(d => d.repo),
+        axisLabel: { color: '#6c6a64', fontSize: 12 },
+        axisLine: { lineStyle: { color: '#e6dfd8' } },
+      },
+      series: [
+        { name: '已关闭（merged/failed）', type: 'bar', stack: 'total', data: data.map(d => d.closed), itemStyle: { color: '#5db872' }, barMaxWidth: 40 },
+        { name: '进行中', type: 'bar', stack: 'total', data: data.map(d => d.open), itemStyle: { color: '#e8a55a' }, barMaxWidth: 40 },
+      ],
     });
   }
 
   // ---- 柱状图：平均修复时长（最近 7 天，按天） ----
   function renderDurationByMonth(data) {
-    if (!data.length) return;
-    const canvas = document.getElementById('dash-duration');
-    if (!canvas || !window.Chart) return;
-    new Chart(canvas, {
-      type: 'bar',
-      data: {
-        labels: data.map(d => d.day),
-        datasets: [{
-          label: '平均时长',
-          data: data.map(d => Math.round(d.avg_ms / 1000 / 60)), // 分钟
-          backgroundColor: '#5da0db',
-          borderRadius: 6,
-          maxBarThickness: 48,
-        }]
+    const chart = getChart('dash-duration');
+    if (!chart) return;
+    if (!data.length) { chart.clear(); return; }
+    chart.setOption({
+      tooltip: { trigger: 'axis', formatter: (p) => `${p[0].name}<br/>平均时长: ${p[0].value} 分钟` },
+      legend: { show: false },
+      grid: { left: 50, right: 16, top: 16, bottom: 30 },
+      xAxis: {
+        type: 'category',
+        data: data.map(d => d.day),
+        axisLabel: { color: '#6c6a64', fontSize: 11, formatter: v => v.slice(5) },
+        axisLine: { lineStyle: { color: '#e6dfd8' } },
       },
-      options: {
-        responsive: true,
-        plugins: { legend: { display: false } },
-        scales: {
-          x: { ticks: { callback: v => v.slice(5) } }, // 去掉年份，只显示 MM-DD
-          y: { beginAtZero: true, title: { display: true, text: '分钟' } },
-        },
-      }
+      yAxis: {
+        type: 'value',
+        name: '分钟',
+        nameTextStyle: { color: '#6c6a64', fontSize: 11 },
+        axisLabel: { color: '#6c6a64', fontSize: 11 },
+        splitLine: { lineStyle: { color: '#ebe6df' } },
+      },
+      series: [{
+        type: 'bar',
+        data: data.map(d => Math.round(d.avg_ms / 1000 / 60)),
+        itemStyle: { color: '#5da0db', borderRadius: [4, 4, 0, 0] },
+        barMaxWidth: 40,
+      }],
     });
   }
 
